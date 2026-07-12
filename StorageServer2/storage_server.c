@@ -4,6 +4,8 @@
 #include <grp.h>
 #include <pwd.h>
 #include <dirent.h>
+#include <sys/wait.h>
+#include <limits.h>
 
 
 StorageServer my_info;
@@ -17,26 +19,58 @@ int create_zip(const char *folder_to_zip, const char *output_zip_file) {
         fprintf(stderr, "Error: Invalid folder or output file path.\n");
         return -1;
     }
-    pid_t pid = fork();
-    // printf("Folder to zip: %s\n", folder_to_zip);
-    struct stat path_stat;
-    stat(folder_to_zip, &path_stat);
-    if (S_ISDIR(path_stat.st_mode)) {
-        strcat(folder_to_zip, "/");
-    }
-    
 
+    // Prefer zip when available; fall back to tar.gz (rename still uses .zip suffix for protocol compat).
+    int use_tar = (access("/usr/bin/zip", X_OK) != 0 && access("/bin/zip", X_OK) != 0);
+
+    pid_t pid = fork();
     if (pid < 0) {
         perror("Fork failed");
         return -1;
     } else if (pid == 0) {
-        //redirect STDIN, STDERR nad STDOUT to /dev/null
         int fd = open("/dev/null", O_WRONLY);
-        dup2(fd, STDOUT_FILENO);
-        dup2(fd, STDERR_FILENO);
-        dup2(fd, STDIN_FILENO);
-        execlp("zip", "zip", "-r", output_zip_file, folder_to_zip, (char *)NULL);
-
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            dup2(fd, STDIN_FILENO);
+        }
+        if (use_tar) {
+            struct stat st;
+            if (stat(folder_to_zip, &st) == 0 && S_ISREG(st.st_mode)) {
+                char dirbuf[PATH_MAX];
+                char namebuf[PATH_MAX];
+                strncpy(dirbuf, folder_to_zip, sizeof(dirbuf) - 1);
+                dirbuf[sizeof(dirbuf) - 1] = '\0';
+                char* slash = strrchr(dirbuf, '/');
+                if (slash) {
+                    *slash = '\0';
+                    strncpy(namebuf, slash + 1, sizeof(namebuf) - 1);
+                    namebuf[sizeof(namebuf) - 1] = '\0';
+                    if (dirbuf[0] == '\0') {
+                        strcpy(dirbuf, ".");
+                    }
+                } else {
+                    strcpy(dirbuf, ".");
+                    strncpy(namebuf, folder_to_zip, sizeof(namebuf) - 1);
+                    namebuf[sizeof(namebuf) - 1] = '\0';
+                }
+                execlp("tar", "tar", "-czf", output_zip_file, "-C", dirbuf, namebuf, (char *)NULL);
+            } else {
+                execlp("tar", "tar", "-czf", output_zip_file, "-C", folder_to_zip, ".", (char *)NULL);
+            }
+        } else {
+            char zip_target[PATH_MAX];
+            strncpy(zip_target, folder_to_zip, sizeof(zip_target) - 2);
+            zip_target[sizeof(zip_target) - 2] = '\0';
+            struct stat path_stat;
+            if (stat(folder_to_zip, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
+                size_t len = strlen(zip_target);
+                if (len == 0 || zip_target[len - 1] != '/') {
+                    strcat(zip_target, "/");
+                }
+            }
+            execlp("zip", "zip", "-r", output_zip_file, zip_target, (char *)NULL);
+        }
         perror("execlp failed");
         exit(1);
     } else {
@@ -47,10 +81,9 @@ int create_zip(const char *folder_to_zip, const char *output_zip_file) {
         }
 
         if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            // printf("Successfully created ZIP file: %s\n", output_zip_file);
             return 0;
         } else {
-            fprintf(stderr, "Error: Failed to create ZIP file.\n");
+            fprintf(stderr, "Error: Failed to create archive file.\n");
             return -1;
         }
     }
@@ -62,19 +95,32 @@ int unzip_and_delete_in_place(const char *zip_file) {
         return -1;
     }
 
+    int use_tar = 0;
+    FILE* probe = fopen(zip_file, "rb");
+    if (probe) {
+        unsigned char magic[2] = {0};
+        fread(magic, 1, 2, probe);
+        fclose(probe);
+        // gzip magic 1f 8b, or plain tar without compression detection via extension/heuristic
+        if (magic[0] == 0x1f && magic[1] == 0x8b) {
+            use_tar = 1;
+        }
+    }
+
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("Fork failed");
         return -1;
     } else if (pid == 0) {
-        // Child process: Unzip the file in place
-        execlp("unzip", "unzip","-uo", "-q", zip_file, (char *)NULL);
-
+        if (use_tar) {
+            execlp("tar", "tar", "-xzf", zip_file, (char *)NULL);
+        } else {
+            execlp("unzip", "unzip","-uo", "-q", zip_file, (char *)NULL);
+        }
         perror("execlp failed");
         exit(1);
     } else {
-        // Parent process: Wait for the child process to complete
         int status;
         if (waitpid(pid, &status, 0) == -1) {
             perror("waitpid failed");
@@ -82,17 +128,14 @@ int unzip_and_delete_in_place(const char *zip_file) {
         }
 
         if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            // printf("Successfully unzipped file: %s\n", zip_file);
-
             if (unlink(zip_file) == 0) {
-                // printf("Successfully deleted ZIP file: %s\n", zip_file);
                 return 0;
             } else {
-                perror("Failed to delete ZIP file");
+                perror("Failed to delete archive file");
                 return -1;
             }
         } else {
-            fprintf(stderr, "Error: Failed to unzip file.\n");
+            fprintf(stderr, "Error: Failed to extract archive file.\n");
             return -1;
         }
     }
@@ -226,19 +269,14 @@ int copy_path(const char *src_path, const char *dest_path) {
         return -1;
     }
 
+    const char *last_slash = strrchr(src_path, '/');
+    const char *base_name = last_slash ? last_slash + 1 : src_path;
+    char new_dest_path[PATH_MAX];
+    snprintf(new_dest_path, sizeof(new_dest_path), "%s/%s", dest_path, base_name);
+
     if (S_ISDIR(src_stat.st_mode)) {
-        char *last_slash = strrchr(src_path, '/');
-        char new_dest_path[PATH_MAX];
-        strcpy(new_dest_path, dest_path);
-        strcat(new_dest_path, "/");
-        strcat(new_dest_path, last_slash + 1);
         return copy_directory(src_path, new_dest_path);
     } else if (S_ISREG(src_stat.st_mode)) {
-        char *last_slash = strrchr(src_path, '/');
-        char new_dest_path[PATH_MAX];
-        strcpy(new_dest_path, dest_path);
-        strcat(new_dest_path, "/");
-        strcat(new_dest_path, last_slash + 1);
         return copy_file(src_path, new_dest_path);
     } else {
         fprintf(stderr, "Unsupported file type for path: %s\n", src_path);
@@ -544,11 +582,19 @@ void handle_nm_create(int sockfd, Command cmd){
     Response response;
     char file_path[512];
     strcpy(file_path, root_path);
-    if(cmd.path[0] != '/')
+    if(strcmp(cmd.path, "/") != 0){
+        if(cmd.path[0] != '/')
+            strcat(file_path, "/");
         strcat(file_path, cmd.path);
+    }
     strcat(file_path, "/");
 
-    char* new_path = malloc(cmd.size);
+    char* new_path = malloc(cmd.size + 1);
+    if(!new_path){
+        response.error = ERR_NETWORK;
+        send(sockfd, &response, sizeof(Response), 0);
+        return;
+    }
     strcpy(new_path, cmd.data);
 
     char* token = strtok(new_path, "/");
@@ -561,6 +607,7 @@ void handle_nm_create(int sockfd, Command cmd){
             if(status != 0 && errno != EEXIST){
                 response.error = ERR_INVALID_PATH;
                 send(sockfd, &response, sizeof(Response), 0);
+                free(new_path);
                 return;
             }
             strcat(file_path, "/");
@@ -568,10 +615,10 @@ void handle_nm_create(int sockfd, Command cmd){
         else {
             if(cmd.isFIle){
                 int fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
-                if(fd <= 0){
-                    close(fd);
+                if(fd < 0){
                     response.error = ERR_PERMISSION_DENIED;
                     send(sockfd, &response, sizeof(Response), 0);
+                    free(new_path);
                     return;
                 }
                 close(fd);
@@ -581,15 +628,20 @@ void handle_nm_create(int sockfd, Command cmd){
                 if(status != 0 && errno != EEXIST){
                     response.error = ERR_INVALID_PATH;
                     send(sockfd, &response, sizeof(Response), 0);
+                    free(new_path);
                     return;
                 }
             }
             response.error = ACK;
             send(sockfd, &response, sizeof(Response), 0);
-            printf("Hello\n");
+            free(new_path);
             return;
         }
+        token = next_token;
     }
+    free(new_path);
+    response.error = ERR_INVALID_PATH;
+    send(sockfd, &response, sizeof(Response), 0);
 }
 
 void deleteFolderContents(const char* path) {
@@ -668,7 +720,6 @@ void handle_client_copy(int sockfd, Command cmd){
         if(cmd.dest_path[0] != '/')
             strcat(final_dest_path, "/");
         strcat(final_dest_path, cmd.dest_path);
-        copy_path(final_path, final_dest_path);
         if(copy_path(final_path, final_dest_path) == -1){
             response.error = ERR_PERMISSION_DENIED;
             send(sockfd, &response, sizeof(Response), 0);
@@ -695,9 +746,7 @@ void handle_client_copy(int sockfd, Command cmd){
         if(cmd.path[0] != '/')
             strcat(final_path, "/");
         strcat(final_path, cmd.path);
-        char* temp_file_name;
-        temp_file_name = malloc(512);
-        temp_file_name = "temp.zip";
+        const char* temp_file_name = "temp.zip";
         create_zip(final_path, temp_file_name);
         cmd.type = CMD_RECEIVE_COPY;
         send(ss2_connect, &cmd, sizeof(Command), 0);
@@ -793,6 +842,7 @@ void handle_client_info(int sockfd, Command cmd){
     if(stat(file_path, &filestat) < 0){
         response.error = ERR_PERMISSION_DENIED;
         send(sockfd, &response, sizeof(Response), 0);
+        return;
     }
 
     mode_t mode = filestat.st_mode;
@@ -832,7 +882,7 @@ void handle_client_info(int sockfd, Command cmd){
     response.error = ACK;
     response.buffer_size = strlen(output)+1;
     send(sockfd, &response, sizeof(Response), 0);
-    send(sockfd, output, strlen(output), 0);
+    send(sockfd, output, response.buffer_size, 0);
 }
 
 void* handle_connection(void* arg){
@@ -889,8 +939,8 @@ void* handle_connection(void* arg){
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 5) {
-        printf("Usage: %s <nm_ip> <nm_port> <client_port> <root_path>\n", argv[0]);
+    if (argc != 5 && argc != 6) {
+        printf("Usage: %s <nm_ip> <nm_port> <client_port> <root_path> [advertise_ip]\n", argv[0]);
         return 1;
     }
     strcpy(nm_ip, argv[1]);
@@ -900,17 +950,13 @@ int main(int argc, char* argv[]) {
     strcpy(root_path, argv[4]);
     scan_directory(argv[4]);
 
-    char hostbuffer[256];
-    char *IPbuffer;
-    struct hostent *host_entry;
-    int hostname;
-    hostname = gethostname(hostbuffer, sizeof(hostbuffer));
-    host_entry = gethostbyname(hostbuffer);
-
-    IPbuffer = inet_ntoa(*((struct in_addr*)
-                        host_entry->h_addr_list[0]));
-
-    strcpy(my_info.server_details.ip, IPbuffer);
+    if (argc == 6) {
+        strncpy(my_info.server_details.ip, argv[5], sizeof(my_info.server_details.ip) - 1);
+        my_info.server_details.ip[sizeof(my_info.server_details.ip) - 1] = '\0';
+    } else {
+        // Prefer loopback for local/dev clusters so clients can always reach us.
+        strcpy(my_info.server_details.ip, "127.0.0.1");
+    }
 
     register_ss();
 
@@ -928,7 +974,7 @@ int main(int argc, char* argv[]) {
 
 
     listen(server_socket, SOMAXCONN);
-    log_message("Storage server started on port %d", my_info.server_details.port);
+    log_message("Storage server started on port %d (%s)", my_info.server_details.port, my_info.server_details.ip);
 
     while (1) {
         struct sockaddr_in client_addr;

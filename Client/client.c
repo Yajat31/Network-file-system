@@ -173,7 +173,7 @@ void play_audio_stream(int socket) {
     pthread_t stop_thread;
     if (pthread_create(&stop_thread, NULL, monitor_stop_signal, NULL) != 0) {
         perror("ERROR creating stop monitor thread");
-        fclose(mpv_input);
+        pclose(mpv_input);
         return;
     }
 
@@ -184,7 +184,7 @@ void play_audio_stream(int socket) {
 		perror("ERROR receiving data");
 	}
 	printf("Stream finished.\n");
-	fclose(mpv_input);
+	pclose(mpv_input);
     pthread_cancel(stop_thread);
     pthread_join(stop_thread, NULL);
 }
@@ -230,7 +230,7 @@ void execute_command(char* command) {
         send(ss_socket, &cmd, sizeof(Command), 0);
         receive_file(ss_socket);
         close(ss_socket);
-        recv(nm_socket, &response, sizeof(Response), 0);
+        close(nm_socket);
         if(response.error == ERR_PATH_NOT_FOUND){
             printf("Path not found\n");
         }
@@ -301,24 +301,29 @@ void execute_command(char* command) {
             if(!inSync){
                 int child = fork();
                 if(child == 0){
-                    //redirect all output to /dev/null
                     int fd = open("/dev/null", O_WRONLY);
-                    //redirect stdout, stdin, stderr to /dev/null
                     dup2(fd, STDOUT_FILENO);
                     dup2(fd, STDERR_FILENO);
                     dup2(fd, STDIN_FILENO);
                     send_file(ss_socket, local_path);
+                    close(ss_socket);
+                    close(nm_socket);
+                    _exit(0);
                 }
+                printf("Async write started for %s\n", path);
             }
             else{
                 send_file(ss_socket, local_path);
+                printf("Write complete for %s\n", path);
             }
         }
+        close(ss_socket);
+        close(nm_socket);
     }
     else if(strcmp(token, "create") == 0){
         token = strtok(NULL, " ");
 
-        if(!token || (token[0] != '-') || token[1] != 'f' && token[1] != 'd'){
+        if(!token || token[0] != '-' || (token[1] != 'f' && token[1] != 'd')){
             printf("Usage: create -f/-d <path> <name>\n");
             return;
         }
@@ -329,7 +334,7 @@ void execute_command(char* command) {
         
         token = strtok(NULL, " ");
         if (!token) {
-            printf("Usage: create -f/d <path>\n");
+            printf("Usage: create -f/-d <path> <name>\n");
             return;
         }
         strcpy(name, token);
@@ -354,7 +359,11 @@ void execute_command(char* command) {
         send(nm_socket, &cmd, sizeof(Command), 0);
         Response response;
         recv(nm_socket, &response, sizeof(Response), 0);
-        if(response.error == ERR_PATH_NOT_FOUND){
+        close(nm_socket);
+        if(response.error == ACK){
+            printf("Created %s/%s\n", strcmp(path, "/") == 0 ? "" : path, name);
+        }
+        else if(response.error == ERR_PATH_NOT_FOUND){
             printf("Path not found\n");
         }
         else if(response.error == ERR_PERMISSION_DENIED){
@@ -363,13 +372,12 @@ void execute_command(char* command) {
         else if(response.error == ERR_SERVER_DOWN){
             printf("Storage server is down\n");
         }
-        int ss_socket = connect_to_server(response.ip, response.port);
-        if(ss_socket < 0){
-            printf("Failed to connect to storage server\n");
-            return;
+        else if(response.error == ERR_INVALID_PATH){
+            printf("Invalid path\n");
         }
-        send(ss_socket, &cmd, sizeof(Command), 0);
-
+        else{
+            printf("Create failed (error %d)\n", response.error);
+        }
     }
     else if(strcmp(token, "delete") == 0){
         token = strtok(NULL, " ");
@@ -398,6 +406,7 @@ void execute_command(char* command) {
         else if(response.error == ERR_SERVER_DOWN){
             printf("Storage server is down\n");
         }
+        close(nm_socket);
     }
     else if(strcmp(token, "copy") == 0){
         token = strtok(NULL, " ");
@@ -417,6 +426,21 @@ void execute_command(char* command) {
         int nm_socket = connect_to_server(nm_ip, nm_port);
         if (nm_socket < 0) return;
         send(nm_socket, &cmd, sizeof(Command), 0);
+        Response response;
+        recv(nm_socket, &response, sizeof(Response), 0);
+        close(nm_socket);
+        if(response.error == ACK){
+            printf("Copied %s -> %s\n", cmd.path, cmd.dest_path);
+        }
+        else if(response.error == ERR_PATH_NOT_FOUND){
+            printf("Path not found\n");
+        }
+        else if(response.error == ERR_SERVER_DOWN){
+            printf("Storage server is down\n");
+        }
+        else{
+            printf("Copy failed (error %d)\n", response.error);
+        }
     }
     else if(strcmp(token, "list") == 0) {
         token = strtok(NULL, " ");

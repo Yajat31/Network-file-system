@@ -1,0 +1,25 @@
+# Build artifacts
+naming_server
+storage_server
+client
+*.o
+*.out
+*.exe
+
+# Runtime / logs
+nfs.log
+*.zip
+backup*.zip
+temp.zip
+
+# Local test roots and bench scratch
+data/
+bench/tmp/
+bench/results_raw.txt
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

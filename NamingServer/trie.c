@@ -68,6 +68,13 @@ TrieNode* insert_path(const char* path, bool isFolder, int ss) {
             if (strcmp(trienodes[childIndex].name, token) == 0) {
                 currentIndex = childIndex;
                 found = true;
+                if (trienodes[childIndex].deleted) {
+                    trienodes[childIndex].deleted = false;
+                    trienodes[childIndex].isFolder = isFolder;
+                    trienodes[childIndex].isFile = !isFolder;
+                    trienodes[childIndex].mainServer = ss;
+                    trienodes[childIndex].childCount = 0;
+                }
                 break;
             }
         }
@@ -81,6 +88,10 @@ TrieNode* insert_path(const char* path, bool isFolder, int ss) {
         token = strtok(NULL, "/");
     }
 
+    trienodes[currentIndex].isFolder = isFolder;
+    trienodes[currentIndex].isFile = !isFolder;
+    trienodes[currentIndex].mainServer = ss;
+    trienodes[currentIndex].deleted = false;
     return &trienodes[currentIndex];
 }
 
@@ -100,7 +111,7 @@ TrieNode* searchPath(const char* path) {
         bool found = false;
         for (int i = 0; i < trienodes[currentIndex].childCount; i++) {
             int childIndex = trienodes[currentIndex].children[i];
-            if (strcmp(trienodes[childIndex].name, token) == 0) {
+            if (strcmp(trienodes[childIndex].name, token) == 0 && !trienodes[childIndex].deleted) {
                 currentIndex = childIndex;
                 found = true;
                 break;
@@ -137,7 +148,7 @@ void deletePath(const char* path) {
     deleteSubtree(node->id);
 }
 
-void printSubpathsRecursive(int nodeIndex, char* currentPath) {
+void printSubpathsRecursive(int nodeIndex, const char* currentPath) {
     TrieNode* node = &trienodes[nodeIndex];
 
     char newPath[PATHLEN];
@@ -182,7 +193,7 @@ int countSubpaths(const char* path) {
     return node->childCount;
 }
 
-void collectSubpaths(int nodeIndex, char* currentPath, char* result, ssize_t bufferSize) {
+void collectSubpaths(int nodeIndex, const char* currentPath, char** result, size_t* bufferSize) {
     TrieNode* node = &trienodes[nodeIndex];
 
     char newPath[PATHLEN];
@@ -192,22 +203,23 @@ void collectSubpaths(int nodeIndex, char* currentPath, char* result, ssize_t buf
         snprintf(newPath, PATHLEN, "%s/%s", currentPath, node->name);
     }
 
-    // Ensure enough space in the buffer
-    size_t newLength = strlen(result) + strlen(newPath) + 2; // +2 for '\n' and '\0'
-    if (newLength > bufferSize) {
-        bufferSize *= 2;
-        result = (char*)realloc(result, bufferSize);
-        if (!result) {
+    size_t newLength = strlen(*result) + strlen(newPath) + 2;
+    if (newLength > *bufferSize) {
+        *bufferSize *= 2;
+        if (newLength > *bufferSize) {
+            *bufferSize = newLength;
+        }
+        char* resized = (char*)realloc(*result, *bufferSize);
+        if (!resized) {
             perror("Failed to reallocate memory for concatenated subpaths");
             exit(EXIT_FAILURE);
         }
+        *result = resized;
     }
 
-    // Add the path to the result
-    strcat(result, newPath);
-    strcat(result, "\n");
+    strcat(*result, newPath);
+    strcat(*result, "\n");
 
-    // Recursively process children
     for (int i = 0; i < node->childCount; i++) {
         int childIndex = node->children[i];
         if (!trienodes[childIndex].deleted) {
@@ -218,12 +230,11 @@ void collectSubpaths(int nodeIndex, char* currentPath, char* result, ssize_t buf
 
 char* concatenateSubpaths(const char* path) {
     TrieNode* node = searchPath(path);
-    if (!node) {
+    if (!node || node->deleted) {
         printf("Path not found: %s\n", path);
         return NULL;
     }
 
-    // Initialize a dynamic buffer to hold the concatenated subpaths
     size_t bufferSize = 1024;
     char* result = (char*)malloc(bufferSize);
     if (!result) {
@@ -231,13 +242,12 @@ char* concatenateSubpaths(const char* path) {
         return NULL;
     }
 
-    result[0] = '\0'; // Start with an empty string
+    result[0] = '\0';
 
-    // Start collecting subpaths from the given node
     for (int i = 0; i < node->childCount; i++) {
         int childIndex = node->children[i];
         if (!trienodes[childIndex].deleted) {
-            collectSubpaths(childIndex, path, result, bufferSize);
+            collectSubpaths(childIndex, path, &result, &bufferSize);
         }
     }
     return result;

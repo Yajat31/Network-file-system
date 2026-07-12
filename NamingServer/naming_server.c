@@ -85,6 +85,7 @@ void check_server_health(ServerHealth* health){
 
     StorageServer* ss = health->server;
     int is_responsive = 0;
+    int was_down = !ss->is_alive;
 
     for(int i = 0; i < MAX_RETRIES && !is_responsive; i++){
         is_responsive = test_server_connection(ss->server_details.ip, ss->server_details.port);
@@ -96,7 +97,7 @@ void check_server_health(ServerHealth* health){
 
     pthread_mutex_lock(&health_mutex);
     if(is_responsive){
-        if(health->failed_checks > 0){
+        if(health->failed_checks > 0 || was_down){
             log_message("Storage server %s:%d is back online", ss->server_details.ip, ss->server_details.port);
         }
         health->failed_checks = 0;
@@ -113,47 +114,87 @@ void check_server_health(ServerHealth* health){
     health->is_being_checked = 0;
     pthread_mutex_unlock(&health_mutex);
 
-    Command cmd;
-    cmd.type = CMD_BACKUP;
-    if(ss->backups[0] != -1){
-        strcpy(cmd.backups[0].ip, ss->backup_servers[0].ip);
-        cmd.backups[0].port = ss->backup_servers[0].port;
-    }
-    else{
-        cmd.backups[0].port = -1;
-    }
-    if(ss->backups[1] != -1){
-        strcpy(cmd.backups[1].ip, ss->backup_servers[1].ip);
-        cmd.backups[1].port = ss->backup_servers[1].port;
-    }
-    else{
-        cmd.backups[1].port = -1;
-    }
-    int ss_connect = connect_to_server(ss->server_details.ip, ss->server_details.port);
-    if(ss_connect < 0){
-        close(ss_connect);
-        log_message("Failed to connect to storage server %s:%d", ss->server_details.ip, ss->server_details.port);
-    }
-    else{
-        send(ss_connect, &cmd, sizeof(Command), 0);
-        close(ss_connect);
+    // Only push backup metadata when a server recovers; avoid re-zipping every health tick.
+    if(is_responsive && was_down){
+        Command cmd;
+        memset(&cmd, 0, sizeof(Command));
+        cmd.type = CMD_BACKUP;
+        if(ss->backups[0] != -1){
+            strcpy(cmd.backups[0].ip, ss->backup_servers[0].ip);
+            cmd.backups[0].port = ss->backup_servers[0].port;
+        }
+        else{
+            cmd.backups[0].port = -1;
+        }
+        if(ss->backups[1] != -1){
+            strcpy(cmd.backups[1].ip, ss->backup_servers[1].ip);
+            cmd.backups[1].port = ss->backup_servers[1].port;
+        }
+        else{
+            cmd.backups[1].port = -1;
+        }
+        int ss_connect = connect_to_server(ss->server_details.ip, ss->server_details.port);
+        if(ss_connect < 0){
+            log_message("Failed to connect to storage server %s:%d", ss->server_details.ip, ss->server_details.port);
+        }
+        else{
+            send(ss_connect, &cmd, sizeof(Command), 0);
+            close(ss_connect);
+        }
     }
 }
 
 void* monitor_server(void* arg){
+    (void)arg;
     while(1){
+        int count;
         pthread_mutex_lock(&server_mutex);
-        for(int i = 0; i < server_count; i++){
+        count = server_count;
+        pthread_mutex_unlock(&server_mutex);
+
+        for(int i = 0; i < count; i++){
             time_t current_time = time(NULL);
-            if(current_time - server_health[i].last_check > HEALTH_CHECK_INTERVAL){
-                log_message("Checking server health for %s:%d", storage_servers[i].server_details.ip, storage_servers[i].server_details.port);
+            pthread_mutex_lock(&health_mutex);
+            int due = (current_time - server_health[i].last_check > HEALTH_CHECK_INTERVAL);
+            char ip[16];
+            int port = 0;
+            if(due && server_health[i].server){
+                strcpy(ip, server_health[i].server->server_details.ip);
+                port = server_health[i].server->server_details.port;
+            }
+            pthread_mutex_unlock(&health_mutex);
+
+            if(due){
+                log_message("Checking server health for %s:%d", ip, port);
                 check_server_health(&server_health[i]);
             }
         }
-        pthread_mutex_unlock(&server_mutex);
         sleep(1);
     }
     return NULL;
+}
+
+static void assign_backups_for_new_server(int idx) {
+    storage_servers[idx].backups[0] = -1;
+    storage_servers[idx].backups[1] = -1;
+
+    if (idx >= 1) {
+        storage_servers[idx].backups[0] = idx - 1;
+        storage_servers[idx].backup_servers[0] = storage_servers[idx - 1].server_details;
+
+        // Also let the previous server use this one as a backup peer.
+        if (storage_servers[idx - 1].backups[0] == -1) {
+            storage_servers[idx - 1].backups[0] = idx;
+            storage_servers[idx - 1].backup_servers[0] = storage_servers[idx].server_details;
+        } else if (storage_servers[idx - 1].backups[1] == -1) {
+            storage_servers[idx - 1].backups[1] = idx;
+            storage_servers[idx - 1].backup_servers[1] = storage_servers[idx].server_details;
+        }
+    }
+    if (idx >= 2) {
+        storage_servers[idx].backups[1] = idx - 2;
+        storage_servers[idx].backup_servers[1] = storage_servers[idx - 2].server_details;
+    }
 }
 
 void handle_storage_server_registration(int socket) {
@@ -177,6 +218,9 @@ void handle_storage_server_registration(int socket) {
     
     if (server_idx >= 0) {
         storage_servers[server_idx].is_alive = 1;
+        storage_servers[server_idx].path_count = ss.path_count;
+        memcpy(storage_servers[server_idx].paths, ss.paths, sizeof(ss.paths));
+        memcpy(storage_servers[server_idx].isFolder, ss.isFolder, sizeof(ss.isFolder));
         pthread_mutex_unlock(&server_mutex);
         for(int i = 0; i < ss.path_count; i++){
             insert_path(ss.paths[i], ss.isFolder[i], server_idx);
@@ -185,41 +229,16 @@ void handle_storage_server_registration(int socket) {
     } else {
         storage_servers[server_count] = ss;
         storage_servers[server_count].is_alive = 1;
-        
-        storage_servers[server_count].backups[0] = -1;
-        storage_servers[server_count].backups[1] = -1;
-
-        if(server_count == 1){
-            storage_servers[0].backups[0] = 1;
-            storage_servers[0].backup_servers[0] = storage_servers[1].server_details;
-            storage_servers[1].backups[0] = 1;
-            storage_servers[1].backup_servers[0] = storage_servers[0].server_details;
-        }
-        else if(server_count == 2){
-            storage_servers[0].backups[1] = 2;
-            storage_servers[0].backup_servers[1] = storage_servers[2].server_details;
-            storage_servers[1].backups[1] = 2;
-            storage_servers[1].backup_servers[1] = storage_servers[2].server_details;
-
-            storage_servers[2].backups[0] = 0;
-            storage_servers[2].backup_servers[0] = storage_servers[0].server_details;
-            storage_servers[2].backups[1] = 1;
-            storage_servers[2].backup_servers[1] = storage_servers[0].server_details;
-        }
-        else if(server_count > 2) {
-            storage_servers[server_count].backups[0] = server_count-1;
-            storage_servers[server_count].backups[1] = server_count-2;
-            storage_servers[server_count].backup_servers[0] = storage_servers[server_count-1].server_details;
-            storage_servers[server_count].backup_servers[1] = storage_servers[server_count-2].server_details;
-        }
+        assign_backups_for_new_server(server_count);
         
         for (int i = 0; i < ss.path_count; i++) {
             insert_path(ss.paths[i], ss.isFolder[i], server_count);
         }
         server_count++;
+        int new_idx = server_count - 1;
         pthread_mutex_unlock(&server_mutex);
-        log_message("Storage server %d registered: %s:%d", server_count, ss.server_details.ip, ss.server_details.port);
-        init_server_health(&storage_servers[server_count-1], server_count - 1);
+        log_message("Storage server %d registered: %s:%d", new_idx, ss.server_details.ip, ss.server_details.port);
+        init_server_health(&storage_servers[new_idx], new_idx);
     }
 }
 
@@ -251,20 +270,26 @@ int get_random_alive_server() {
     return alive_servers[random_idx];
 }
 
+static void rewrite_backup_path(Command* cmd, int original_idx) {
+    char final_path[512];
+    snprintf(final_path, sizeof(final_path), "./ss%d%s", original_idx + 1, cmd->path);
+    strcpy(cmd->path, final_path);
+    cmd->isbackup = 1;
+    printf("Final path: %s\n", cmd->path);
+}
+
 void handle_client_read(int sockfd, Command cmd){
     log_message("Client requested command: CMD_READ for path %s", cmd.path);
     Response response;
+    memset(&response, 0, sizeof(Response));
     int server_idx = check_cache(cmd.path);
     int original_idx = server_idx;
-    TrieNode* node;
     if(server_idx == -1){
-        node = searchPath(cmd.path);
-        if(node == NULL){
-            if(server_idx == -1){
-                response.error = ERR_PATH_NOT_FOUND;
-                send(sockfd, &response, sizeof(Response), 0);
-                return;
-            }
+        TrieNode* node = searchPath(cmd.path);
+        if(node == NULL || node->deleted){
+            response.error = ERR_PATH_NOT_FOUND;
+            send(sockfd, &response, sizeof(Response), 0);
+            return;
         }
         server_idx = node->mainServer;
         original_idx = server_idx;
@@ -290,15 +315,7 @@ void handle_client_read(int sockfd, Command cmd){
         }
     }
     if(isbackup){
-        char final_path[512];
-        strcpy(final_path, "./ss");
-        char num[10];
-        sprintf(num, "%d", original_idx+1);
-        strcat(final_path, num);
-        strcat(final_path, cmd.path);
-        strcpy(cmd.path, final_path);
-        printf("Final path: %s\n", cmd.path);
-        cmd.isbackup = isbackup;
+        rewrite_backup_path(&cmd, original_idx);
     }
     response.error = ACK;
     strcpy(response.ip, storage_servers[server_idx].server_details.ip);
@@ -313,18 +330,24 @@ void handle_client_write(int sockfd, Command cmd){
     int server_idx = check_cache(cmd.path);
     if(server_idx == -1){
         TrieNode* node = searchPath(cmd.path);
-        if(node == NULL){
+        if(node == NULL || node->deleted){
             response.error = ERR_PATH_NOT_FOUND;
             send(sockfd, &response, sizeof(Response), 0);
             return;
         }
         server_idx = node->mainServer;
+        update_cache(cmd.path, server_idx);
     }
-    while(storage_servers[server_idx].is_alive == 0){
-        if(storage_servers[server_idx].backups[0] != -1){
+
+    int hops = 0;
+    while(storage_servers[server_idx].is_alive == 0 && hops < 3){
+        hops++;
+        if(storage_servers[server_idx].backups[0] != -1 &&
+           storage_servers[storage_servers[server_idx].backups[0]].is_alive){
             server_idx = storage_servers[server_idx].backups[0];
         }
-        else if(storage_servers[server_idx].backups[1] != -1){
+        else if(storage_servers[server_idx].backups[1] != -1 &&
+                storage_servers[storage_servers[server_idx].backups[1]].is_alive){
             server_idx = storage_servers[server_idx].backups[1];
         }
         else{
@@ -332,6 +355,11 @@ void handle_client_write(int sockfd, Command cmd){
             send(sockfd, &response, sizeof(Response), 0);
             return;
         }
+    }
+    if(storage_servers[server_idx].is_alive == 0){
+        response.error = ERR_SERVER_DOWN;
+        send(sockfd, &response, sizeof(Response), 0);
+        return;
     }
     response.error = ACK;
     strcpy(response.ip, storage_servers[server_idx].server_details.ip);
@@ -342,12 +370,18 @@ void handle_client_write(int sockfd, Command cmd){
 void handle_client_create(int sockfd, Command cmd){
     log_message("Client requested command: CMD_CREATE for path %s", cmd.path);
     int server_idx = check_cache(cmd.path);
-    TrieNode* node;
-    Response response;
+    Response response = {0};
     response.error = ACK;
+
     if(server_idx == -1){
-        node = searchPath(cmd.path);
-        if(node != NULL){
+        TrieNode* node = searchPath(cmd.path);
+        if(node == NULL || node->deleted){
+            response.error = ERR_PATH_NOT_FOUND;
+            send(sockfd, &response, sizeof(Response), 0);
+            return;
+        }
+        server_idx = node->mainServer;
+        if(server_idx < 0 || server_idx >= server_count || !storage_servers[server_idx].is_alive){
             server_idx = get_random_alive_server();
             if(server_idx == -1){
                 response.error = ERR_SERVER_DOWN;
@@ -355,10 +389,18 @@ void handle_client_create(int sockfd, Command cmd){
                 return;
             }
         }
-        else{
-            server_idx = node->mainServer;
+        update_cache(cmd.path, server_idx);
+    }
+
+    if(!storage_servers[server_idx].is_alive){
+        server_idx = get_random_alive_server();
+        if(server_idx == -1){
+            response.error = ERR_SERVER_DOWN;
+            send(sockfd, &response, sizeof(Response), 0);
+            return;
         }
     }
+
     int ss_connect = connect_to_server(storage_servers[server_idx].server_details.ip, storage_servers[server_idx].server_details.port);
     if(ss_connect < 0){
         response.error = ERR_SERVER_DOWN;
@@ -367,7 +409,8 @@ void handle_client_create(int sockfd, Command cmd){
     }
     send(ss_connect, &cmd, sizeof(Command), 0);
     recv(ss_connect, &response, sizeof(Response), 0);
-    printf("Response error: %d\n", response.error);
+    close(ss_connect);
+
     char final_path[512];
     strcpy(final_path, cmd.path);
     if(strcmp(final_path, "/") != 0)
@@ -376,60 +419,57 @@ void handle_client_create(int sockfd, Command cmd){
     printf("Final path: %s\n", final_path);
     if(response.error == ACK){
         insert_path(final_path, !cmd.isFIle, server_idx);
+        update_cache(final_path, server_idx);
         log_message("Path created: %s", final_path);
-    }       
+        strcpy(response.ip, storage_servers[server_idx].server_details.ip);
+        response.port = storage_servers[server_idx].server_details.port;
+    }
+    send(sockfd, &response, sizeof(Response), 0);
 }
 
 void handle_client_delete(int sockfd, Command cmd){
     log_message("Client requested command: CMD_DELETE for path %s", cmd.path);
-    int server_idx = check_cache(cmd.path);
-    TrieNode* node;
-    if(server_idx == -1){
-        node = searchPath(cmd.path);
-        if(node == NULL){
-            Response response = {0};
-            response.error = ERR_PATH_NOT_FOUND;
-            send(sockfd, &response, sizeof(Response), 0);
-            return;
-        }
-        server_idx = node->mainServer;
-    }
     Response response = {0};
-    if(server_idx == -1){
+    int server_idx = check_cache(cmd.path);
+    TrieNode* node = searchPath(cmd.path);
+
+    if(node == NULL || node->deleted){
         response.error = ERR_PATH_NOT_FOUND;
         send(sockfd, &response, sizeof(Response), 0);
+        return;
     }
-    else{
-        int server_idx = node->mainServer;
-        if(storage_servers[server_idx].is_alive){
-            
-            int ss_connection = connect_to_server(storage_servers[server_idx].server_details.ip, storage_servers[server_idx].server_details.port);
-            if(ss_connection < 0){
-                response.error = ERR_SERVER_DOWN;
-                send(sockfd, &response, sizeof(Response), 0);
-                return;
-            }
-            send(ss_connection, &cmd, sizeof(Command), 0);
-            recv(ss_connection, &response, sizeof(Response), 0);
-            if(response.error == ACK){
-                deletePath(cmd.path);
-            }
-            close(ss_connection);
-            send(sockfd, &response, sizeof(Response), 0);
-        }
-        else{
-            response.error = ERR_SERVER_DOWN;
-            send(sockfd, &response, sizeof(Response), 0);
-        }
+    if(server_idx == -1){
+        server_idx = node->mainServer;
+        update_cache(cmd.path, server_idx);
     }
+
+    if(server_idx < 0 || server_idx >= server_count || !storage_servers[server_idx].is_alive){
+        response.error = ERR_SERVER_DOWN;
+        send(sockfd, &response, sizeof(Response), 0);
+        return;
+    }
+
+    int ss_connection = connect_to_server(storage_servers[server_idx].server_details.ip, storage_servers[server_idx].server_details.port);
+    if(ss_connection < 0){
+        response.error = ERR_SERVER_DOWN;
+        send(sockfd, &response, sizeof(Response), 0);
+        return;
+    }
+    send(ss_connection, &cmd, sizeof(Command), 0);
+    recv(ss_connection, &response, sizeof(Response), 0);
+    if(response.error == ACK){
+        deletePath(cmd.path);
+    }
+    close(ss_connection);
+    send(sockfd, &response, sizeof(Response), 0);
 }
 
 void handle_client_copy(int sockfd, Command cmd){
     log_message("Client requested command: CMD_COPY for path %s", cmd.path);
-    Response response;
+    Response response = {0};
     TrieNode* node = searchPath(cmd.path);
     int server_idx1;
-    if(node == NULL){
+    if(node == NULL || node->deleted){
         response.error = ERR_PATH_NOT_FOUND;
         send(sockfd, &response, sizeof(Response), 0);
         return;
@@ -453,16 +493,23 @@ void handle_client_copy(int sockfd, Command cmd){
         }
     }
     else{
-        TrieNode* node = searchPath(cmd.dest_path);
-        if(node == NULL){
-            response.error = ERR_SERVER_DOWN;
+        TrieNode* dest_node = searchPath(cmd.dest_path);
+        if(dest_node == NULL || dest_node->deleted){
+            response.error = ERR_PATH_NOT_FOUND;
             send(sockfd, &response, sizeof(Response), 0);
             return;
         }
         else{
-            server_idx2 = node->mainServer;
+            server_idx2 = dest_node->mainServer;
             if(storage_servers[server_idx2].is_alive == 0){
-                server_idx2 = storage_servers[server_idx2].backups[0];
+                if(storage_servers[server_idx2].backups[0] != -1 &&
+                   storage_servers[storage_servers[server_idx2].backups[0]].is_alive){
+                    server_idx2 = storage_servers[server_idx2].backups[0];
+                } else {
+                    response.error = ERR_SERVER_DOWN;
+                    send(sockfd, &response, sizeof(Response), 0);
+                    return;
+                }
             }
         }
     }
@@ -479,17 +526,29 @@ void handle_client_copy(int sockfd, Command cmd){
     response.port = storage_servers[server_idx2].server_details.port;
     send(ss_connection, &response, sizeof(Response), 0);
     recv(ss_connection, &response, sizeof(Response), 0);
+    close(ss_connection);
     if(response.error == ACK){
         log_message("Path copied from %s to %s", cmd.path, cmd.dest_path);
         printf("Path copied from %s to %s\n", cmd.path, cmd.dest_path);
+        // Best-effort: register dest in trie under destination server.
+        char dest_entry[512];
+        const char* base = strrchr(cmd.path, '/');
+        base = base ? base + 1 : cmd.path;
+        if(strcmp(cmd.dest_path, "/") == 0){
+            snprintf(dest_entry, sizeof(dest_entry), "/%s", base);
+        } else {
+            snprintf(dest_entry, sizeof(dest_entry), "%s/%s", cmd.dest_path, base);
+        }
+        insert_path(dest_entry, node->isFolder, server_idx2);
     }
+    send(sockfd, &response, sizeof(Response), 0);
 }
 
 void handle_client_list(int sockfd, Command cmd){
     log_message("Client requested command: CMD_LIST for path %s", cmd.path);
     TrieNode* node = searchPath(cmd.path);
     Response response = {0};
-    if(node == NULL){
+    if(node == NULL || node->deleted){
         log_message("Path not found: %s", cmd.path);
         response.error = ERR_PATH_NOT_FOUND;
         send(sockfd, &response, sizeof(Response), 0);
@@ -498,27 +557,31 @@ void handle_client_list(int sockfd, Command cmd){
     else{
         log_message("Path found: %s", cmd.path);
         char* list = concatenateSubpaths(cmd.path);
+        if(!list){
+            response.error = ERR_PATH_NOT_FOUND;
+            send(sockfd, &response, sizeof(Response), 0);
+            return;
+        }
         response.error = ACK;
-        response.buffer_size = strlen(list)+1;
+        response.buffer_size = (int)strlen(list) + 1;
         send(sockfd, &response, sizeof(Response), 0);
-        send(sockfd, list, strlen(list), 0);
+        send(sockfd, list, response.buffer_size, 0);
+        free(list);
     }
 }
 
 void handle_client_stream(int sockfd, Command cmd){
     printf("Client requested command: CMD_STREAM for path %s\n", cmd.path);
     Response response;
+    memset(&response, 0, sizeof(Response));
     int server_idx = check_cache(cmd.path);
     int original_idx = server_idx;
-    TrieNode* node;
     if(server_idx == -1){
-        node = searchPath(cmd.path);
-        if(node == NULL){
-            if(server_idx == -1){
-                response.error = ERR_PATH_NOT_FOUND;
-                send(sockfd, &response, sizeof(Response), 0);
-                return;
-            }
+        TrieNode* node = searchPath(cmd.path);
+        if(node == NULL || node->deleted){
+            response.error = ERR_PATH_NOT_FOUND;
+            send(sockfd, &response, sizeof(Response), 0);
+            return;
         }
         server_idx = node->mainServer;
         original_idx = server_idx;
@@ -544,16 +607,7 @@ void handle_client_stream(int sockfd, Command cmd){
         }
     }
     if(isbackup){
-        char final_path[512];
-        strcpy(final_path, "./ss");
-        char num[10];
-        sprintf(num, "%d", original_idx+1);
-        strcat(final_path, num);
-        strcat(final_path, "/");
-        strcat(final_path, cmd.path);
-        strcpy(cmd.path, final_path);
-        printf("Final path: %s\n", cmd.path);
-        cmd.isbackup = isbackup;
+        rewrite_backup_path(&cmd, original_idx);
     }
     response.error = ACK;
     strcpy(response.ip, storage_servers[server_idx].server_details.ip);
@@ -563,19 +617,17 @@ void handle_client_stream(int sockfd, Command cmd){
 }
 
 void handle_client_info(int sockfd, Command cmd){
-    printf("Client requested command: CMD_STREAM for path %s\n", cmd.path);
+    printf("Client requested command: CMD_INFO for path %s\n", cmd.path);
     Response response;
+    memset(&response, 0, sizeof(Response));
     int server_idx = check_cache(cmd.path);
     int original_idx = server_idx;
-    TrieNode* node;
     if(server_idx == -1){
-        node = searchPath(cmd.path);
-        if(node == NULL){
-            if(server_idx == -1){
-                response.error = ERR_PATH_NOT_FOUND;
-                send(sockfd, &response, sizeof(Response), 0);
-                return;
-            }
+        TrieNode* node = searchPath(cmd.path);
+        if(node == NULL || node->deleted){
+            response.error = ERR_PATH_NOT_FOUND;
+            send(sockfd, &response, sizeof(Response), 0);
+            return;
         }
         server_idx = node->mainServer;
         original_idx = server_idx;
@@ -601,16 +653,7 @@ void handle_client_info(int sockfd, Command cmd){
         }
     }
     if(isbackup){
-        char final_path[512];
-        strcpy(final_path, "./ss");
-        char num[10];
-        sprintf(num, "%d", original_idx+1);
-        strcat(final_path, num);
-        strcat(final_path, "/");
-        strcat(final_path, cmd.path);
-        strcpy(cmd.path, final_path);
-        printf("Final path: %s\n", cmd.path);
-        cmd.isbackup = isbackup;
+        rewrite_backup_path(&cmd, original_idx);
     }
     response.error = ACK;
     strcpy(response.ip, storage_servers[server_idx].server_details.ip);

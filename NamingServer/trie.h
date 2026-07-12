@@ -31,9 +31,9 @@ TrieNode* insert_path(const char* path, bool isFolder, int ss);
 TrieNode* searchPath(const char* path);
 void deletePath(const char* path);
 int countSubpaths(const char* path);
-void printSubpathsRecursive(int nodeIndex, char* currentPath);
+void printSubpathsRecursive(int nodeIndex, const char* currentPath);
 void printSubpaths(const char* path);
-void collectSubpaths(int nodeIndex, char* currentPath, char* result, ssize_t bufferSize);
+void collectSubpaths(int nodeIndex, const char* currentPath, char** result, size_t* bufferSize);
 char* concatenateSubpaths(const char* path);
 
 #endif
